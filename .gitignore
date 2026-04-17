@@ -1,0 +1,21 @@
+# kortix/opencode internal dirs — excluded from agent snapshots
+.local/share/opencode/
+.cache/
+.config/
+.opencode/
+.kortix/
+.kortix-state/
+.secrets/
+.browser-profile/
+.agent-browser/
+.lss/
+.ocx/
+.XDG/
+.bun/
+.npm-global/
+.npm/
+.dbus/
+.pki/
+.ssh/
+ssl/
+opencode
