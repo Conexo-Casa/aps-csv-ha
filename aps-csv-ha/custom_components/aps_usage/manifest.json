@@ -1,0 +1,13 @@
+{
+  "domain": "aps_usage",
+  "name": "APS Usage",
+  "codeowners": ["conexocasa"],
+  "config_flow": true,
+  "documentation": "https://github.com/conexocasa/aps-usage-ha",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/conexocasa/aps-usage-ha/issues",
+  "requirements": ["cryptography>=41.0.0"],
+  "dependencies": [],
+  "version": "0.2.0"
+}
