@@ -64,6 +64,7 @@ class APSUsageConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             except Exception as err:  # noqa: BLE001
                 _LOGGER.exception("Unexpected APS error: %s", err)
                 errors["base"] = "unknown"
+                errors["_error_detail"] = str(err)
             else:
                 # Credentials validated — move on to account ID step
                 self._username = username
