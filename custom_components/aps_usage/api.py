@@ -269,30 +269,120 @@ class APSUsageAPI:
         )
 
         if not self._device_id:
-            # Try common field name variations
+            # DefaultPremiseId is the service location / meter premise identifier
             device_id = (
-                acct_details.get("deviceId")
+                profile.get("DefaultPremiseId")
+                or acct_details.get("deviceId")
                 or acct_details.get("DeviceId")
-                or acct_details.get("device_id")
-                or profile.get("deviceId")
-                or profile.get("DeviceId")
             )
-            self._device_id = device_id
-            _LOGGER.debug("APS: device_id=%s", self._device_id)
+            self._device_id = str(device_id) if device_id else None
+            _LOGGER.error("APS: device_id (DefaultPremiseId)=%s", self._device_id)
 
         if not self._sasp_list:
-            sasp = (
-                acct_details.get("sASPList")
-                or acct_details.get("SASPList")
-                or acct_details.get("saspList")
-                or acct_details.get("sasps")
-                or profile.get("sASPList")
-                or []
+            # Build sASPList from AccountsList — each account is a Service Agreement
+            acct_list_raw = (
+                details.get("UserDetails", {})
+                .get("getUserDetailResponse", {})
+                .get("AccountsList", [])
             )
-            self._sasp_list = sasp if isinstance(sasp, list) else [sasp] if sasp else []
-            _LOGGER.debug("APS: sasp_list=%s", self._sasp_list)
+            # Try to extract SA identifiers; fall back to accountId itself
+            sasp = [
+                a.get("AccountID") for a in acct_list_raw if a.get("AccountID")
+            ] or ([self._account_id] if self._account_id else [])
+            self._sasp_list = sasp
+            _LOGGER.error("APS: sasp_list (from AccountsList)=%s", self._sasp_list)
 
         _LOGGER.debug("APS: B2C_AccessToken obtained successfully.")
+
+        # Try to fetch real deviceId/sASPList from mobi account details endpoint
+        await self._fetch_mobi_account_details()
+
+    async def _fetch_mobi_account_details(self) -> None:
+        """Call mobi.aps.com getaccountdetails to get the real deviceId and sASPList.
+
+        This endpoint returns the Service Agreement / Service Point data that
+        getsimpleusagedata requires. We log the full response at ERROR level
+        so the correct field names are visible in system_log.
+        """
+        if not self._b2c_access_token or not self._account_id:
+            return
+
+        headers = {
+            "Host": "mobi.aps.com",
+            "User-Agent": _USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json;charset=utf-8",
+            "Ocp-Apim-Subscription-Key": OCP_APIM_KEY,
+            "Authorization": f"Bearer {self._b2c_access_token}",
+            "Origin": "https://www.aps.com",
+            "Referer": "https://www.aps.com/",
+        }
+
+        # Try multiple endpoint variants that might return device/SASP data
+        endpoints = [
+            (
+                "https://mobi.aps.com/customeraccountservices/v1/getaccountdetails",
+                {
+                    "getAccountDetailsRequest": {
+                        "accountId": self._account_id,
+                        "cssUser": "APSCOM",
+                    }
+                },
+            ),
+            (
+                "https://mobi.aps.com/customeraccountservices/v1/getdevicedetails",
+                {
+                    "getDeviceDetailsRequest": {
+                        "accountId": self._account_id,
+                        "cssUser": "APSCOM",
+                    }
+                },
+            ),
+            (
+                "https://mobi.aps.com/customeraccountservices/v1/getpremisedetails",
+                {
+                    "getPremiseDetailsRequest": {
+                        "accountId": self._account_id,
+                        "premiseId": self._device_id,
+                        "cssUser": "APSCOM",
+                    }
+                },
+            ),
+        ]
+
+        for url, payload in endpoints:
+            try:
+                async with self._session.post(
+                    url, headers=headers, json=payload
+                ) as resp:
+                    body = await resp.text()
+                    _LOGGER.error(
+                        "APS: mobi %s → HTTP %s: %s",
+                        url.split("/")[-1],
+                        resp.status,
+                        body[:600],
+                    )
+                    if resp.status == 200 and body.strip():
+                        import json as _json
+
+                        try:
+                            data = _json.loads(body)
+                            # Try to extract deviceId and sASPList from whatever comes back
+                            flat = str(data)
+                            if (
+                                "deviceId" in flat
+                                or "sASPList" in flat
+                                or "sasp" in flat.lower()
+                            ):
+                                _LOGGER.error(
+                                    "APS: Found device/sasp data in %s: %s",
+                                    url.split("/")[-1],
+                                    flat[:800],
+                                )
+                        except Exception:
+                            pass
+            except Exception as err:
+                _LOGGER.debug("APS: mobi %s failed: %s", url.split("/")[-1], err)
 
     async def _ensure_authenticated(self) -> None:
         """Ensure we have a valid, unexpired token."""
