@@ -71,6 +71,8 @@ class APSUsageAPI:
         self._password = password
         self._b2c_access_token: str | None = None
         self._account_id: str | None = None
+        self._device_id: str | None = None
+        self._sasp_list: list | None = None
         self._token_expiry: datetime | None = None
 
     # ------------------------------------------------------------------
@@ -206,10 +208,13 @@ class APSUsageAPI:
         details = full.get("Details", {})
         profile = details.get("profileData", {})
 
-        _LOGGER.debug(
-            "APS: GetAllUserDetails — Details keys=%s, profileData keys=%s",
+        # Log structure at ERROR so it appears in system_log for debugging
+        _LOGGER.error(
+            "APS: GetAllUserDetails structure — Details keys=%s | "
+            "profileData keys=%s | AccountDetails preview=%s",
             list(details.keys()),
             list(profile.keys()) if profile else "EMPTY",
+            str(details.get("AccountDetails", {}))[:600],
         )
 
         if not profile:
@@ -234,11 +239,10 @@ class APSUsageAPI:
         self._b2c_access_token = token
         self._token_expiry = datetime.now() + timedelta(minutes=55)
 
-        # Also grab account ID while we have the data
+        # Also grab account ID, deviceId, and sASPList while we have the data
         if not self._account_id:
             account_id = profile.get("AccountID")
             if not account_id:
-                # Fall back to AccountsList
                 accounts = (
                     details.get("UserDetails", {})
                     .get("getUserDetailResponse", {})
@@ -247,6 +251,39 @@ class APSUsageAPI:
                 account_id = accounts[0].get("AccountID") if accounts else None
             self._account_id = account_id
             _LOGGER.debug("APS: account_id=%s", self._account_id)
+
+        # Extract deviceId and sASPList from AccountDetails
+        acct_details = details.get("AccountDetails", {})
+
+        # Log full AccountDetails at ERROR level so it's visible in system_log
+        _LOGGER.error(
+            "APS: AccountDetails full=%s",
+            str(acct_details)[:800],
+        )
+
+        if not self._device_id:
+            # Try common field name variations
+            device_id = (
+                acct_details.get("deviceId")
+                or acct_details.get("DeviceId")
+                or acct_details.get("device_id")
+                or profile.get("deviceId")
+                or profile.get("DeviceId")
+            )
+            self._device_id = device_id
+            _LOGGER.debug("APS: device_id=%s", self._device_id)
+
+        if not self._sasp_list:
+            sasp = (
+                acct_details.get("sASPList")
+                or acct_details.get("SASPList")
+                or acct_details.get("saspList")
+                or acct_details.get("sasps")
+                or profile.get("sASPList")
+                or []
+            )
+            self._sasp_list = sasp if isinstance(sasp, list) else [sasp] if sasp else []
+            _LOGGER.debug("APS: sasp_list=%s", self._sasp_list)
 
         _LOGGER.debug("APS: B2C_AccessToken obtained successfully.")
 
@@ -296,13 +333,27 @@ class APSUsageAPI:
             "Referer": "https://www.aps.com/",
         }
 
+        req: dict = {
+            "accountId": account_id,
+            "startDate": start_date,
+            "endDate": end_date,
+        }
+        # Include deviceId and sASPList if available
+        if self._device_id:
+            req["deviceId"] = self._device_id
+        if self._sasp_list:
+            req["sASPList"] = self._sasp_list
+
+        _LOGGER.error(
+            "APS: mobi payload req=%s device_id=%s sasp_list=%s",
+            req,
+            self._device_id,
+            self._sasp_list,
+        )
+
         payload = {
             "getSimpleUsageDataRequest": {
-                "getSimpleUsageDataReq": {
-                    "accountId": account_id,
-                    "startDate": start_date,
-                    "endDate": end_date,
-                },
+                "getSimpleUsageDataReq": req,
                 "cssUser": "APSCOM",
             }
         }
