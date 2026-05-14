@@ -2,11 +2,8 @@
 
 DOMAIN = "aps_usage"
 
-# Config entry keys
-CONF_ACCOUNT_ID = "account_id"
+# Update interval: every hour (APS data refreshes daily, not real-time)
+UPDATE_INTERVAL_SECONDS = 3600
 
-# Update interval (seconds)
-UPDATE_INTERVAL_SECONDS = 3600  # 1 hour — APS data is not real-time
-
-# Days of history to fetch on each update
-DAYS_OF_HISTORY = 30
+# Days of daily usage history to fetch (60 gives ~2 billing cycles)
+DAYS_OF_HISTORY = 60

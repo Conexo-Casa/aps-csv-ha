@@ -1,9 +1,10 @@
-"""API Client for APS Usage."""
+"""API Client for APS Usage — reverse-engineered from apsconsumerapp APK."""
 
 from __future__ import annotations
 
 import base64
 import logging
+import urllib.parse
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -14,7 +15,7 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 
 _LOGGER = logging.getLogger(__name__)
 
-# Discovered from aps-apscom.js bundle — RSA-2048 public key used by JSEncrypt
+# RSA-2048 public key from aps-apscom.js (used by JSEncrypt for login)
 APS_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAgUhnZn9KwG21odw0+4Jf
 Ie/pdOd+Ry8sdxn4tnmkfZJZ8/5xV31Zi6QqIxoiOQrdROyJaDBtbv0KGS68Yfim
@@ -25,27 +26,30 @@ XFRaJBG+4mX4Vercms2J8u1NIeFdFeTjuo+nAiDsc0z4J9g3gVPC+k2080EBkqHw
 ycwIDAQAB
 -----END PUBLIC KEY-----"""
 
-# Discovered from aps-apscom.js bundle
+# From BuildConfig.java in com.aps.apsconsumerapp APK
 OCP_APIM_KEY = "d2e9aafca6d546cd9097a3e3072cd7a5"
 
-# Must match a real browser to pass Imperva/Incapsula WAF
+# Must match a real Chrome UA to pass Imperva WAF on aps.com
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-LOGIN_URL = "https://www.aps.com/api/sitecore/SitecoreReactApi/UserAuthentication"
-USER_DETAILS_URL = "https://www.aps.com/api/sitecore/sitecorereactapi/GetAllUserDetails"
-USAGE_URL = "https://mobi.aps.com/customeraccountservices/v1/getsimpleusagedata"
+# APS Sitecore web API base
+SITECORE_BASE = "https://www.aps.com"
+LOGIN_URL = f"{SITECORE_BASE}/api/sitecore/SitecoreReactApi/UserAuthentication"
+USER_DETAILS_URL = f"{SITECORE_BASE}/api/sitecore/sitecorereactapi/GetAllUserDetails"
+
+# mobi.aps.com — daily usage charges (GET with query params, discovered from Dashboard.js)
+DAILY_USAGE_URL = "https://mobi.aps.com/ccb-billing/v1/getdailyusagecharges"
+
+# CSS_USER constant from Accounts/Dashboard.js bundle
+CSS_USER = "APSCOM"
 
 
 def _encrypt_password(password: str) -> str:
-    """Encrypt the password using the APS RSA public key (PKCS#1 v1.5).
-
-    APS uses JSEncrypt in the browser which performs RSA PKCS#1 v1.5
-    encryption. The public key and algorithm are hardcoded in aps-apscom.js.
-    """
+    """Encrypt password with APS RSA public key (PKCS#1 v1.5, same as JSEncrypt)."""
     public_key = serialization.load_pem_public_key(APS_PUBLIC_KEY.encode("utf-8"))
     assert isinstance(public_key, RSAPublicKey)
     encrypted = public_key.encrypt(password.encode("utf-8"), padding.PKCS1v15())
@@ -53,11 +57,134 @@ def _encrypt_password(password: str) -> str:
 
 
 class APSAuthError(Exception):
-    """Raised when authentication fails."""
+    """Raised when APS authentication fails."""
+
+
+class APSUsageData:
+    """Container for parsed daily usage data."""
+
+    def __init__(
+        self,
+        series: list[dict],
+        bill_cycle_dates: list[dict],
+        account_id: str,
+        sa_id: str,
+        sp_id: str,
+        premise_id: str,
+        premise_address: str,
+    ) -> None:
+        self.series = series
+        self.bill_cycle_dates = bill_cycle_dates
+        self.account_id = account_id
+        self.sa_id = sa_id
+        self.sp_id = sp_id
+        self.premise_id = premise_id
+        self.premise_address = premise_address
+
+    @property
+    def yesterday_kwh(self) -> float | None:
+        """Return yesterday's total kWh usage."""
+        # series is ordered oldest→newest; skip last entry (today, often empty)
+        for item in reversed(self.series[:-1]):
+            val = item.get("totalUsage") or item.get("totalDailyUsage")
+            if val:
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    pass
+        return None
+
+    @property
+    def today_kwh(self) -> float | None:
+        """Return today's kWh usage (may be partial/estimated)."""
+        if not self.series:
+            return None
+        val = self.series[-1].get("totalUsage") or self.series[-1].get(
+            "totalDailyUsage"
+        )
+        try:
+            return float(val) if val else None
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def current_cycle_kwh(self) -> float:
+        """Total kWh since the most recent billing cycle start date."""
+        if not self.bill_cycle_dates:
+            # Fall back: sum all available series
+            return self.period_kwh(len(self.series))
+        cycle_start_str = self.bill_cycle_dates[0].get("billCycleDate", "")
+        try:
+            cycle_start = datetime.strptime(cycle_start_str, "%Y-%m-%d")
+        except ValueError:
+            return self.period_kwh(len(self.series))
+        total = 0.0
+        for item in self.series:
+            try:
+                item_date = datetime.strptime(item["date"], "%Y-%m-%d")
+                if item_date >= cycle_start:
+                    val = item.get("totalUsage") or item.get("totalDailyUsage") or 0
+                    total += float(val)
+            except (ValueError, TypeError, KeyError):
+                pass
+        return round(total, 2)
+
+    @property
+    def current_bill_cycle_start(self) -> str | None:
+        """Start date of the current billing cycle."""
+        if self.bill_cycle_dates:
+            return self.bill_cycle_dates[0].get("billCycleDate")
+        return None
+
+    def period_kwh(self, days: int) -> float:
+        """Total kWh over the last N days."""
+        recent = self.series[-days:] if len(self.series) >= days else self.series
+        total = 0.0
+        for item in recent:
+            try:
+                total += float(
+                    item.get("totalUsage") or item.get("totalDailyUsage") or 0
+                )
+            except (ValueError, TypeError):
+                pass
+        return round(total, 2)
+
+    @property
+    def latest_date(self) -> str | None:
+        """Date of the most recent data point with actual usage."""
+        for item in reversed(self.series):
+            val = item.get("totalUsage") or item.get("totalDailyUsage")
+            if val:
+                return item.get("date")
+        return None
+
+    @property
+    def on_peak_kwh_yesterday(self) -> float | None:
+        """Yesterday's on-peak kWh."""
+        for item in reversed(self.series[:-1]):
+            val = item.get("onPeakUsage")
+            if val:
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    pass
+        return None
+
+    @property
+    def off_peak_kwh_yesterday(self) -> float | None:
+        """Yesterday's off-peak kWh."""
+        for item in reversed(self.series[:-1]):
+            val = item.get("offPeakUsage")
+            if val:
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    pass
+        return None
 
 
 class APSUsageAPI:
-    """APS Usage API Client with full Sitecore/B2C authentication support."""
+    """APS Usage API — uses web B2C token with mobi.aps.com billing endpoints."""
 
     def __init__(
         self,
@@ -65,350 +192,328 @@ class APSUsageAPI:
         username: str,
         password: str,
     ) -> None:
-        """Initialize the API client."""
         self._session = session
         self._username = username
         self._password = password
         self._b2c_access_token: str | None = None
-        self._account_id: str | None = None
-        self._device_id: str | None = None
-        self._sasp_list: list | None = None
         self._token_expiry: datetime | None = None
+        self._account_id: str | None = None
+        self._email: str | None = None
+        # Active service agreement details (from getSASPListByAccountID)
+        self._sa_id: str | None = None
+        self._sp_id: str | None = None
+        self._premise_id: str | None = None
+        self._premise_address: str | None = None
 
     # ------------------------------------------------------------------
     # Authentication
     # ------------------------------------------------------------------
 
     async def authenticate(self) -> None:
-        """Perform the full APS login and populate the B2C access token.
+        """Login to APS and obtain B2C access token + account/SASP details.
 
-        Reverse-engineered from aps-apscom.js (_readSessionInfo,
-        LoginPageOverlay.js authenticateUser):
-
-        1. POST /api/sitecore/SitecoreReactApi/UserAuthentication
-           with RSA-PKCS1v15-encrypted password.
-           → Sets session cookies (.AspNet.Cookies, ASP.NET_SessionId,
-             DomainSet, etc.) and returns {isLoginSuccess, redirectUrl}.
-
-        2. GET the redirectUrl (the account dashboard) so the server can
-           fully initialize the session and set remaining cookies.
-
-        3. GET /api/sitecore/sitecorereactapi/GetAllUserDetails
-           → Returns {Details: {profileData: {B2C_AccessToken, AccountID, …},
-                                UserDetails: {AccountsList: […]}}}
-           The B2C_AccessToken here is what all mobi.aps.com calls need.
+        Flow (reverse-engineered from aps-apscom.js + apsconsumerapp APK):
+        1. POST UserAuthentication with RSA-encrypted password
+        2. GET the redirectUrl to establish session cookies
+        3. GET GetAllUserDetails → B2C_AccessToken + account/SASP data
         """
         encrypted_pw = _encrypt_password(self._password)
-
         _LOGGER.debug("APS: Authenticating user %s", self._username)
 
-        # Step 1 — POST credentials (password encrypted with APS RSA key)
+        # Step 1: Login
         async with self._session.post(
             LOGIN_URL,
             json={"username": self._username, "password": encrypted_pw},
             headers={
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/plain, */*",
-                "Origin": "https://www.aps.com",
-                "Referer": "https://www.aps.com/en/Authorization/Login",
+                "Origin": SITECORE_BASE,
+                "Referer": f"{SITECORE_BASE}/en/Authorization/Login",
                 "User-Agent": _USER_AGENT,
             },
         ) as resp:
             raw = await resp.text()
             if resp.status != 200 or not raw.strip().startswith("{"):
-                # WAF block returns HTML; credentials issue returns JSON error
-                _LOGGER.error(
-                    "APS: Login HTTP %s, body preview: %s",
-                    resp.status,
-                    raw[:200],
-                )
                 raise APSAuthError(
-                    f"Login request blocked or failed (HTTP {resp.status}). "
-                    "APS may be rate-limiting. Try again in a few minutes."
+                    f"Login blocked/failed (HTTP {resp.status}). "
+                    "APS may be rate-limiting — try again in a few minutes."
                 )
             import json as _json
 
             data: dict[str, Any] = _json.loads(raw)
 
         if not data.get("isLoginSuccess"):
-            error = data.get("error", "unknown")
-            _LOGGER.error("APS: Login rejected — error=%s", error)
-            raise APSAuthError(f"APS credentials rejected: {error}")
+            raise APSAuthError(
+                f"APS credentials rejected: {data.get('error', 'unknown')}"
+            )
 
-        redirect_url: str = data.get("redirectUrl", "")
-        _LOGGER.debug("APS: Login OK, following redirect: %s", redirect_url)
-
-        # Step 2 — GET dashboard to fully initialise the server-side session
-        dashboard_url = (
-            redirect_url
-            or "https://www.aps.com/en/Residential/Account/Overview/Dashboard"
+        redirect_url: str = data.get(
+            "redirectUrl",
+            f"{SITECORE_BASE}/en/Residential/Account/Overview/Dashboard",
         )
+
+        # Step 2: Follow redirect to establish server-side session
         async with self._session.get(
-            dashboard_url,
+            redirect_url,
             headers={
                 "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
-                "Referer": "https://www.aps.com/en/Authorization/Login",
+                "Referer": f"{SITECORE_BASE}/en/Authorization/Login",
                 "User-Agent": _USER_AGENT,
             },
             allow_redirects=True,
         ) as resp:
-            _LOGGER.debug("APS: Dashboard GET → HTTP %s", resp.status)
+            _LOGGER.debug("APS: Session established (HTTP %s)", resp.status)
 
-        # Step 3 — GET all user details; contains B2C_AccessToken + AccountID
+        # Step 3: Get all user details (token + SASP data)
         await self._fetch_user_details()
 
     async def _fetch_user_details(self) -> None:
-        """Call GetAllUserDetails and extract token + account ID.
-
-        Response shape (from _readSessionInfo / populateSessionInfo in JS):
-            {
-              "Details": {
-                "profileData": {
-                  "B2C_AccessToken": "Bearer eyJ...",
-                  "AccountID": "0539389128",
-                  ...
-                },
-                "UserDetails": {
-                  "getUserDetailResponse": {
-                    "AccountsList": [{"AccountID": "0539389128", ...}]
-                  }
-                }
-              }
-            }
-        """
+        """Call GetAllUserDetails and extract token, account ID, and active SASP."""
         async with self._session.get(
             USER_DETAILS_URL,
             headers={
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/plain, */*",
-                "Referer": "https://www.aps.com/en/Residential/Account/Overview/Dashboard",
+                "Referer": f"{SITECORE_BASE}/en/Residential/Account/Overview/Dashboard",
                 "User-Agent": _USER_AGENT,
             },
         ) as resp:
             raw = await resp.text()
             _LOGGER.debug(
-                "APS: GetAllUserDetails HTTP %s, len=%d", resp.status, len(raw)
+                "APS: GetAllUserDetails HTTP %s len=%d", resp.status, len(raw)
             )
 
         if not raw or not raw.strip():
-            raise APSAuthError(
-                "GetAllUserDetails returned empty response. "
-                "The session cookie may not have been established correctly."
-            )
+            raise APSAuthError("GetAllUserDetails returned empty response.")
 
         import json as _json
 
         try:
             full: dict[str, Any] = _json.loads(raw.lstrip("\ufeff"))
         except _json.JSONDecodeError as err:
-            raise APSAuthError(
-                f"GetAllUserDetails response is not JSON: {raw[:200]}"
-            ) from err
+            raise APSAuthError(f"GetAllUserDetails not JSON: {raw[:200]}") from err
 
         details = full.get("Details", {})
         profile = details.get("profileData", {})
 
-        _LOGGER.debug(
-            "APS: GetAllUserDetails — DefaultPremiseId=%s AccountID=%s",
-            profile.get("DefaultPremiseId"),
-            profile.get("AccountID"),
-        )
-
         if not profile:
-            _LOGGER.debug("APS: GetAllUserDetails full response: %s", str(full)[:500])
             raise APSAuthError(
-                "profileData missing from GetAllUserDetails response. "
-                "Session may not be authenticated. Keys: " + str(list(details.keys()))
+                "profileData missing from GetAllUserDetails. "
+                "Keys: " + str(list(details.keys()))
             )
 
-        # B2C_AccessToken may already include the "Bearer " prefix
         token: str = profile.get("B2C_AccessToken", "")
         if not token:
             raise APSAuthError(
-                "B2C_AccessToken not found in profileData. "
-                "Keys: " + str(list(profile.keys()))
+                "B2C_AccessToken not in profileData. Keys: " + str(list(profile.keys()))
             )
-
-        # Strip "Bearer " prefix if present — we add it ourselves
         if token.lower().startswith("bearer "):
             token = token[7:]
 
         self._b2c_access_token = token
         self._token_expiry = datetime.now() + timedelta(minutes=55)
+        self._account_id = profile.get("AccountID")
+        self._email = profile.get("emailAddress", "")
 
-        # Also grab account ID, deviceId, and sASPList while we have the data
-        if not self._account_id:
-            account_id = profile.get("AccountID")
-            if not account_id:
-                accounts = (
-                    details.get("UserDetails", {})
-                    .get("getUserDetailResponse", {})
-                    .get("AccountsList", [])
-                )
-                account_id = accounts[0].get("AccountID") if accounts else None
-            self._account_id = account_id
-            _LOGGER.debug("APS: account_id=%s", self._account_id)
-
-        # Extract deviceId and sASPList from AccountDetails
-        acct_details = details.get("AccountDetails", {})
-
-        # Extract deviceId and sASPList from getSASPListByAccountID in AccountDetails
-        # Structure: AccountDetails.getAccountDetailsResponse.getAccountDetailsRes
-        #              .getSASPListByAccountID.premiseDetailsList[N]
-        #                .premiseID  -> deviceId (DefaultPremiseId)
-        #                .sASPDetails[N].sPID -> each entry in sASPList
-        sasp_data = (
-            acct_details.get("getAccountDetailsResponse", {})
+        # Extract active SASP from getSASPListByAccountID
+        # Active = sAEndDate is empty (open-ended service agreement)
+        acct_res = (
+            details.get("AccountDetails", {})
+            .get("getAccountDetailsResponse", {})
             .get("getAccountDetailsRes", {})
-            .get("getSASPListByAccountID", {})
         )
-        premise_list = sasp_data.get("premiseDetailsList", [])
+        premise_list = acct_res.get("getSASPListByAccountID", {}).get(
+            "premiseDetailsList", []
+        )
+
+        self._sa_id = None
+        self._sp_id = None
+        self._premise_id = None
+        self._premise_address = None
+
+        for premise in premise_list:
+            for sasp in premise.get("sASPDetails", []):
+                sa_end = sasp.get("sAEndDate", "")
+                if not sa_end:  # Empty end date = currently active
+                    self._sa_id = sasp.get("sAID")
+                    self._sp_id = sasp.get("sPID")
+                    self._premise_id = premise.get("premiseID")
+                    self._premise_address = sasp.get("premiseAddress", "")
+                    _LOGGER.debug(
+                        "APS: Active SASP — SA=%s SP=%s premise=%s",
+                        self._sa_id,
+                        self._sp_id,
+                        self._premise_id,
+                    )
+                    break
+            if self._sa_id:
+                break
+
+        if not self._sa_id:
+            # Fallback: take first SASP regardless of end date
+            for premise in premise_list:
+                for sasp in premise.get("sASPDetails", []):
+                    self._sa_id = sasp.get("sAID")
+                    self._sp_id = sasp.get("sPID")
+                    self._premise_id = premise.get("premiseID")
+                    self._premise_address = sasp.get("premiseAddress", "")
+                    break
+                if self._sa_id:
+                    break
 
         _LOGGER.debug(
-            "APS: getSASPListByAccountID premise_list=%s", str(premise_list)[:400]
+            "APS: Authenticated — account=%s sa=%s sp=%s",
+            self._account_id,
+            self._sa_id,
+            self._sp_id,
         )
 
-        if not self._device_id:
-            # Use DefaultPremiseId from profile, confirmed by premiseID in SASP data
-            device_id = profile.get("DefaultPremiseId")
-            if not device_id and premise_list:
-                device_id = premise_list[0].get("premiseID")
-            self._device_id = str(device_id) if device_id else None
-            _LOGGER.debug("APS: device_id=%s", self._device_id)
-
-        if not self._sasp_list:
-            # Extract sPID (Service Point ID) from all premises matching our deviceId
-            sp_ids: list[str] = []
-            for premise in premise_list:
-                if (
-                    str(premise.get("premiseID", "")) == self._device_id
-                    or not self._device_id
-                ):
-                    for sasp in premise.get("sASPDetails", []):
-                        sp_id = sasp.get("sPID")
-                        if sp_id:
-                            sp_ids.append(str(sp_id))
-            self._sasp_list = sp_ids or []
-            _LOGGER.debug("APS: sasp_list (sPIDs)=%s", self._sasp_list)
-
-        _LOGGER.debug("APS: B2C_AccessToken obtained successfully.")
-
     async def _ensure_authenticated(self) -> None:
-        """Ensure we have a valid, unexpired token."""
+        """Ensure token is valid, refreshing if needed."""
         if self._b2c_access_token is None:
             await self.authenticate()
             return
         if self._token_expiry and datetime.now() >= self._token_expiry:
-            _LOGGER.debug("APS: Token expired — refreshing.")
+            _LOGGER.debug("APS: Token expired, refreshing.")
             try:
                 await self._fetch_user_details()
             except APSAuthError:
-                _LOGGER.warning("APS: Token refresh failed — re-authenticating.")
+                _LOGGER.warning("APS: Refresh failed, re-authenticating.")
                 await self.authenticate()
 
     # ------------------------------------------------------------------
     # Data fetching
     # ------------------------------------------------------------------
 
-    async def get_usage_data(
-        self,
-        account_id: str,
-        start_date: str,
-        end_date: str,
-    ) -> dict:
-        """Fetch energy usage data from mobi.aps.com.
+    async def get_daily_usage(self, days: int = 60) -> APSUsageData:
+        """Fetch daily kWh usage from mobi.aps.com/ccb-billing/v1/getdailyusagecharges.
+
+        This endpoint is discovered from Accounts/Dashboard.js. It returns per-day
+        usage broken down by on-peak, off-peak, and total kWh.
 
         Args:
-            account_id: The APS account ID (e.g. "0539389128").
-            start_date: Start date string in format "MM/DD/YYYY".
-            end_date: End date string in format "MM/DD/YYYY".
+            days: Number of days of history to fetch (default 60).
 
         Returns:
-            Parsed JSON response dict from the APS mobile API.
+            APSUsageData with daily series and billing cycle info.
         """
         await self._ensure_authenticated()
 
+        if not self._sa_id or not self._sp_id:
+            raise APSAuthError(
+                "No active service agreement found. "
+                "Cannot fetch usage data without a valid SA/SP."
+            )
+
+        end_dt = datetime.now()
+        start_dt = end_dt - timedelta(days=days)
+
+        params = {
+            "action": "read",
+            "accountNumber": self._account_id or "",
+            "userName": self._username,
+            "emailAddress": self._email or "",
+            "sAID": self._sa_id,
+            "spId": self._sp_id,
+            "startDate": start_dt.strftime("%Y-%m-%d"),
+            "endDate": end_dt.strftime("%Y-%m-%d"),
+            "cSSUser": CSS_USER,
+        }
+
+        url = f"{DAILY_USAGE_URL}?{urllib.parse.urlencode(params)}"
+
+        _LOGGER.debug("APS: Fetching daily usage SA=%s SP=%s", self._sa_id, self._sp_id)
+
         headers = {
-            "Host": "mobi.aps.com",
-            "User-Agent": _USER_AGENT,
             "Accept": "application/json, text/plain, */*",
-            "Content-Type": "application/json;charset=utf-8",
-            "Ocp-Apim-Subscription-Key": OCP_APIM_KEY,
             "Authorization": f"Bearer {self._b2c_access_token}",
-            "Origin": "https://www.aps.com",
-            "Referer": "https://www.aps.com/",
+            "Ocp-Apim-Subscription-Key": OCP_APIM_KEY,
+            "Origin": SITECORE_BASE,
+            "Referer": f"{SITECORE_BASE}/en/Residential/Account/Overview/Dashboard",
+            "User-Agent": _USER_AGENT,
         }
-
-        req: dict = {
-            "accountId": account_id,
-            "startDate": start_date,
-            "endDate": end_date,
-        }
-        # Include deviceId and sASPList if available
-        if self._device_id:
-            req["deviceId"] = self._device_id
-        if self._sasp_list:
-            req["sASPList"] = self._sasp_list
-
-        _LOGGER.debug(
-            "APS: mobi payload — account_id=%s device_id=%s sasp_list=%s dates=%s→%s",
-            account_id,
-            self._device_id,
-            self._sasp_list,
-            start_date,
-            end_date,
-        )
-
-        payload = {
-            "getSimpleUsageDataRequest": {
-                "getSimpleUsageDataReq": req,
-                "cssUser": "APSCOM",
-            }
-        }
-
-        _LOGGER.debug(
-            "APS: mobi POST account_id=%s dates=%s→%s",
-            account_id,
-            start_date,
-            end_date,
-        )
 
         try:
-            async with self._session.post(
-                USAGE_URL, headers=headers, json=payload
-            ) as response:
-                if response.status == 401:
-                    _LOGGER.warning("APS: 401 on usage call — re-authenticating.")
+            async with self._session.get(url, headers=headers) as resp:
+                if resp.status == 401:
+                    _LOGGER.warning("APS: 401 on usage GET — re-authenticating.")
                     await self.authenticate()
                     headers["Authorization"] = f"Bearer {self._b2c_access_token}"
-                    async with self._session.post(
-                        USAGE_URL, headers=headers, json=payload
-                    ) as retry:
-                        retry_body = await retry.text()
-                        _LOGGER.debug(
-                            "APS: mobi retry HTTP %s: %s",
-                            retry.status,
-                            retry_body[:500],
-                        )
+                    async with self._session.get(url, headers=headers) as retry:
                         retry.raise_for_status()
-                        return await retry.json(content_type=None)
-                # Log non-2xx responses before raising
-                if response.status >= 400:
-                    err_body = await response.text()
-                    _LOGGER.error(
-                        "APS: mobi HTTP %s body: %s | account_id=%s | token_prefix=%s",
-                        response.status,
-                        err_body[:500],
-                        account_id,
-                        (self._b2c_access_token or "")[:30] + "...",
+                        data = await retry.json(content_type=None)
+                elif resp.status != 200:
+                    body = await resp.text()
+                    raise Exception(
+                        f"Usage API returned HTTP {resp.status}: {body[:200]}"
                     )
-                    response.raise_for_status()
-                return await response.json(content_type=None)
+                else:
+                    data = await resp.json(content_type=None)
         except aiohttp.ClientError as err:
-            raise Exception(f"Error fetching usage data: {err}") from err
+            raise Exception(f"Connection error fetching usage: {err}") from err
+
+        return APSUsageData(
+            series=data.get("series", []),
+            bill_cycle_dates=data.get("billCycleDates", []),
+            account_id=self._account_id or "",
+            sa_id=self._sa_id,
+            sp_id=self._sp_id,
+            premise_id=self._premise_id or "",
+            premise_address=self._premise_address or "",
+        )
+
+    async def get_financial_data(self) -> dict[str, Any]:
+        """Return financial data extracted from GetAllUserDetails.
+
+        This data is always available after authentication — no extra API call needed.
+        Returns current bill amount, due date, last payment, autopay status.
+        """
+        await self._ensure_authenticated()
+        # Re-fetch to get fresh financial data
+        async with self._session.get(
+            USER_DETAILS_URL,
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/plain, */*",
+                "Referer": f"{SITECORE_BASE}/en/Residential/Account/Overview/Dashboard",
+                "User-Agent": _USER_AGENT,
+            },
+        ) as resp:
+            raw = await resp.text()
+
+        import json as _json
+
+        try:
+            full = _json.loads(raw.lstrip("\ufeff"))
+        except _json.JSONDecodeError:
+            return {}
+
+        details = full.get("Details", {})
+        profile = details.get("profileData", {})
+        fin = (
+            details.get("AccountDetails", {})
+            .get("getAccountDetailsResponse", {})
+            .get("getAccountDetailsRes", {})
+            .get("getAccountFinancialDetails", {})
+        )
+
+        return {
+            "account_id": profile.get("AccountID", ""),
+            "outstanding_balance": fin.get(
+                "currentBalance", profile.get("OutstandingBillAmount")
+            ),
+            "due_date": fin.get("dueDt", profile.get("DueDate")),
+            "last_payment_amount": fin.get("lastPayAmt"),
+            "last_payment_date": fin.get("lastPayDt"),
+            "auto_pay": profile.get("autoPay") == "Y",
+            "budget_billing": profile.get("isEnrolledInBudget") == "Y",
+            "new_charges": fin.get("newCharges"),
+            "premise_address": self._premise_address or "",
+            "rate_plan": None,  # filled by coordinator after usage fetch
+        }
 
     async def get_account_id(self) -> str | None:
-        """Return the account ID discovered during authentication."""
+        """Return the account ID after authentication."""
         if self._account_id is None:
             await self._ensure_authenticated()
         return self._account_id

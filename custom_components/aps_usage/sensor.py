@@ -1,8 +1,8 @@
-"""Sensor platform for APS Usage."""
+"""Sensor platform for APS Usage — kWh and billing sensors."""
 
 from __future__ import annotations
 
-import logging
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -16,10 +16,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from . import APSUsageDataUpdateCoordinator
+from . import APSDataCoordinator
+from .api import APSUsageData
 from .const import DOMAIN
-
-_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
@@ -27,156 +26,243 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up APS Usage sensor platform."""
-    coordinator: APSUsageDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    """Set up APS Usage sensors."""
+    coordinator: APSDataCoordinator = hass.data[DOMAIN][entry.entry_id]
     async_add_entities(
         [
-            APSUsageSensor(coordinator, entry),
-            APSDailyUsageSensor(coordinator, entry),
+            APSYesterdayKwhSensor(coordinator, entry),
+            APSCurrentCycleKwhSensor(coordinator, entry),
+            APSThirtyDayKwhSensor(coordinator, entry),
+            APSOnPeakYesterdaySensor(coordinator, entry),
+            APSOffPeakYesterdaySensor(coordinator, entry),
+            APSBalanceSensor(coordinator, entry),
+            APSDueDateSensor(coordinator, entry),
+            APSLastPaymentSensor(coordinator, entry),
         ],
         update_before_add=True,
     )
 
 
-def _extract_total_kwh(data: dict[str, Any]) -> float | None:
-    """Extract total kWh from the APS API response.
-
-    The APS mobi API returns a nested structure. We walk it defensively
-    and return the most recent total consumption value in kWh.
-
-    Known response path (based on reverse engineering):
-    data
-      -> getSimpleUsageDataResponse
-        -> getSimpleUsageDataRes
-          -> usageList (list)
-            -> each item: {date, kwhUsage, cost, ...}
-    """
-    try:
-        res = data.get("getSimpleUsageDataResponse", {}).get(
-            "getSimpleUsageDataRes", {}
-        )
-        usage_list = res.get("usageList") or res.get("UsageList") or []
-        if not usage_list:
-            _LOGGER.debug("APS: usageList is empty in response")
-            return None
-        total = sum(
-            float(item.get("kwhUsage") or item.get("KwhUsage") or 0)
-            for item in usage_list
-        )
-        return round(total, 3)
-    except (TypeError, ValueError, AttributeError) as err:
-        _LOGGER.warning("APS: Failed to extract total kWh: %s", err)
-        return None
-
-
-def _extract_latest_daily_kwh(data: dict[str, Any]) -> float | None:
-    """Extract the most recent single-day kWh from the APS API response."""
-    try:
-        res = data.get("getSimpleUsageDataResponse", {}).get(
-            "getSimpleUsageDataRes", {}
-        )
-        usage_list = res.get("usageList") or res.get("UsageList") or []
-        if not usage_list:
-            return None
-        # The list is ordered oldest-first; last item is most recent
-        latest = usage_list[-1]
-        kwh = latest.get("kwhUsage") or latest.get("KwhUsage")
-        return round(float(kwh), 3) if kwh is not None else None
-    except (TypeError, ValueError, AttributeError) as err:
-        _LOGGER.warning("APS: Failed to extract daily kWh: %s", err)
-        return None
-
-
-class APSUsageSensor(CoordinatorEntity, SensorEntity):
-    """Sensor reporting total kWh used over the configured history window."""
-
-    _attr_name = "APS Energy Usage (30 Days)"
-    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
-    _attr_device_class = SensorDeviceClass.ENERGY
-    _attr_state_class = SensorStateClass.TOTAL_INCREASING
-    _attr_icon = "mdi:lightning-bolt"
+class _APSBase(CoordinatorEntity, SensorEntity):
+    """Base class for APS sensors."""
 
     def __init__(
-        self,
-        coordinator: APSUsageDataUpdateCoordinator,
-        entry: ConfigEntry,
+        self, coordinator: APSDataCoordinator, entry: ConfigEntry, key: str
     ) -> None:
-        """Initialize the sensor."""
         super().__init__(coordinator)
         self._entry = entry
-        self._attr_unique_id = f"{entry.entry_id}_total_kwh"
+        self._attr_unique_id = f"{entry.entry_id}_{key}"
 
     @property
-    def native_value(self) -> float | None:
-        """Return total kWh for the history window."""
-        if self.coordinator.data is None:
-            return None
-        return _extract_total_kwh(self.coordinator.data)
+    def _usage(self) -> APSUsageData | None:
+        if self.coordinator.data:
+            return self.coordinator.data.get("usage")
+        return None
+
+    @property
+    def _financial(self) -> dict:
+        if self.coordinator.data:
+            return self.coordinator.data.get("financial", {})
+        return {}
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return extra attributes from the API response."""
-        if not self.coordinator.data:
-            return {}
-        try:
-            res = self.coordinator.data.get("getSimpleUsageDataResponse", {}).get(
-                "getSimpleUsageDataRes", {}
-            )
-            usage_list = res.get("usageList") or res.get("UsageList") or []
-            return {
-                "account_id": self.coordinator.account_id,
-                "data_points": len(usage_list),
-            }
-        except AttributeError:
-            return {}
+        fin = self._financial
+        usage = self._usage
+        attrs: dict[str, Any] = {
+            "account_id": fin.get("account_id", ""),
+            "premise_address": fin.get("premise_address", ""),
+        }
+        if usage:
+            attrs["latest_data_date"] = usage.latest_date
+            attrs["bill_cycle_start"] = usage.current_bill_cycle_start
+        return attrs
 
 
-class APSDailyUsageSensor(CoordinatorEntity, SensorEntity):
-    """Sensor reporting the most recent single day's kWh usage.
+class APSYesterdayKwhSensor(_APSBase):
+    """Yesterday's total energy usage in kWh."""
 
-    This sensor is suitable for the Home Assistant Energy panel when
-    configured with state_class=MEASUREMENT.
-    """
-
-    _attr_name = "APS Daily Energy Usage"
+    _attr_name = "APS Yesterday kWh"
     _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_state_class = SensorStateClass.MEASUREMENT
-    _attr_icon = "mdi:home-lightning-bolt"
+    _attr_icon = "mdi:lightning-bolt"
+    _attr_suggested_display_precision = 2
 
-    def __init__(
-        self,
-        coordinator: APSUsageDataUpdateCoordinator,
-        entry: ConfigEntry,
-    ) -> None:
-        """Initialize the sensor."""
-        super().__init__(coordinator)
-        self._entry = entry
-        self._attr_unique_id = f"{entry.entry_id}_daily_kwh"
+    def __init__(self, coordinator: APSDataCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "yesterday_kwh")
 
     @property
     def native_value(self) -> float | None:
-        """Return the most recent day's kWh usage."""
-        if self.coordinator.data is None:
-            return None
-        return _extract_latest_daily_kwh(self.coordinator.data)
+        usage = self._usage
+        return usage.yesterday_kwh if usage else None
+
+
+class APSCurrentCycleKwhSensor(_APSBase):
+    """Total energy usage since the current billing cycle started."""
+
+    _attr_name = "APS Current Billing Cycle kWh"
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+    _attr_icon = "mdi:home-lightning-bolt"
+    _attr_suggested_display_precision = 2
+
+    def __init__(self, coordinator: APSDataCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "current_cycle_kwh")
+
+    @property
+    def native_value(self) -> float | None:
+        usage = self._usage
+        return usage.current_cycle_kwh if usage else None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return date of the most recent data point."""
-        if not self.coordinator.data:
-            return {}
+        attrs = super().extra_state_attributes
+        attrs["rate_plan"] = self._financial.get("rate_plan")
+        return attrs
+
+
+class APSThirtyDayKwhSensor(_APSBase):
+    """Total energy usage over the last 30 days."""
+
+    _attr_name = "APS 30-Day kWh"
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:calendar-month"
+    _attr_suggested_display_precision = 2
+
+    def __init__(self, coordinator: APSDataCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "thirty_day_kwh")
+
+    @property
+    def native_value(self) -> float | None:
+        usage = self._usage
+        return usage.period_kwh(30) if usage else None
+
+
+class APSOnPeakYesterdaySensor(_APSBase):
+    """Yesterday's on-peak energy usage."""
+
+    _attr_name = "APS Yesterday On-Peak kWh"
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:lightning-bolt-circle"
+    _attr_suggested_display_precision = 2
+
+    def __init__(self, coordinator: APSDataCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "on_peak_yesterday")
+
+    @property
+    def native_value(self) -> float | None:
+        usage = self._usage
+        return usage.on_peak_kwh_yesterday if usage else None
+
+
+class APSOffPeakYesterdaySensor(_APSBase):
+    """Yesterday's off-peak energy usage."""
+
+    _attr_name = "APS Yesterday Off-Peak kWh"
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:lightning-bolt-outline"
+    _attr_suggested_display_precision = 2
+
+    def __init__(self, coordinator: APSDataCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "off_peak_yesterday")
+
+    @property
+    def native_value(self) -> float | None:
+        usage = self._usage
+        return usage.off_peak_kwh_yesterday if usage else None
+
+
+class APSBalanceSensor(_APSBase):
+    """Current outstanding bill balance."""
+
+    _attr_name = "APS Current Balance"
+    _attr_native_unit_of_measurement = "USD"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:currency-usd"
+    _attr_suggested_display_precision = 2
+
+    def __init__(self, coordinator: APSDataCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "balance")
+
+    @property
+    def native_value(self) -> float | None:
+        val = self._financial.get("outstanding_balance")
         try:
-            res = self.coordinator.data.get("getSimpleUsageDataResponse", {}).get(
-                "getSimpleUsageDataRes", {}
-            )
-            usage_list = res.get("usageList") or res.get("UsageList") or []
-            if usage_list:
-                latest = usage_list[-1]
-                return {
-                    "date": latest.get("date") or latest.get("Date"),
-                    "account_id": self.coordinator.account_id,
-                }
-        except AttributeError:
-            pass
-        return {}
+            return float(val) if val is not None else None
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        fin = self._financial
+        return {
+            "account_id": fin.get("account_id", ""),
+            "due_date": fin.get("due_date", ""),
+            "new_charges": fin.get("new_charges"),
+            "auto_pay": fin.get("auto_pay"),
+            "budget_billing": fin.get("budget_billing"),
+            "last_payment_amount": fin.get("last_payment_amount"),
+            "last_payment_date": fin.get("last_payment_date"),
+        }
+
+
+class APSDueDateSensor(_APSBase):
+    """Bill due date."""
+
+    _attr_name = "APS Bill Due Date"
+    _attr_device_class = SensorDeviceClass.DATE
+    _attr_icon = "mdi:calendar-clock"
+
+    def __init__(self, coordinator: APSDataCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "due_date")
+
+    @property
+    def native_value(self):  # type: ignore[override]
+        """Return due date as a date object."""
+        val = self._financial.get("due_date", "")
+        if not val:
+            return None
+        for fmt in ("%m-%d-%Y", "%Y-%m-%d", "%m/%d/%Y", "%m-%d-%y"):
+            try:
+                return datetime.strptime(val, fmt).date()  # noqa: DTZ007
+            except ValueError:
+                continue
+        return None
+
+
+class APSLastPaymentSensor(_APSBase):
+    """Most recent payment amount."""
+
+    _attr_name = "APS Last Payment"
+    _attr_native_unit_of_measurement = "USD"
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:check-circle"
+    _attr_suggested_display_precision = 2
+
+    def __init__(self, coordinator: APSDataCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator, entry, "last_payment")
+
+    @property
+    def native_value(self) -> float | None:
+        val = self._financial.get("last_payment_amount")
+        try:
+            return float(val) if val is not None else None
+        except (ValueError, TypeError):
+            return None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            "last_payment_date": self._financial.get("last_payment_date"),
+            "account_id": self._financial.get("account_id", ""),
+        }
