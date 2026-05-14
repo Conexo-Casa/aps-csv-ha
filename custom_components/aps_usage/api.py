@@ -208,13 +208,20 @@ class APSUsageAPI:
         details = full.get("Details", {})
         profile = details.get("profileData", {})
 
-        # Log structure at ERROR so it appears in system_log for debugging
+        # Log key values at ERROR so they appear in system_log for debugging
+        acct_list = (
+            details.get("UserDetails", {})
+            .get("getUserDetailResponse", {})
+            .get("AccountsList", [])
+        )
         _LOGGER.error(
-            "APS: GetAllUserDetails structure — Details keys=%s | "
-            "profileData keys=%s | AccountDetails preview=%s",
-            list(details.keys()),
-            list(profile.keys()) if profile else "EMPTY",
-            str(details.get("AccountDetails", {}))[:600],
+            "APS: GetAllUserDetails — DefaultPremiseId=%s | SAStatusFlag=%s | "
+            "AccountID=%s | AccountsList[0]=%s | AccountsList[1]=%s",
+            profile.get("DefaultPremiseId"),
+            profile.get("SAStatusFlag"),
+            profile.get("AccountID"),
+            str(acct_list[0])[:400] if acct_list else "EMPTY",
+            str(acct_list[1])[:400] if len(acct_list) > 1 else "N/A",
         )
 
         if not profile:
@@ -258,7 +265,7 @@ class APSUsageAPI:
         # Log full AccountDetails at ERROR level so it's visible in system_log
         _LOGGER.error(
             "APS: AccountDetails full=%s",
-            str(acct_details)[:800],
+            str(acct_details)[:1500],
         )
 
         if not self._device_id:
