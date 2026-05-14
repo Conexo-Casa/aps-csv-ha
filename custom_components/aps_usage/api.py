@@ -206,6 +206,12 @@ class APSUsageAPI:
         details = full.get("Details", {})
         profile = details.get("profileData", {})
 
+        _LOGGER.debug(
+            "APS: GetAllUserDetails — Details keys=%s, profileData keys=%s",
+            list(details.keys()),
+            list(profile.keys()) if profile else "EMPTY",
+        )
+
         if not profile:
             _LOGGER.debug("APS: GetAllUserDetails full response: %s", str(full)[:500])
             raise APSAuthError(
@@ -301,6 +307,13 @@ class APSUsageAPI:
             }
         }
 
+        _LOGGER.debug(
+            "APS: mobi POST account_id=%s dates=%s→%s",
+            account_id,
+            start_date,
+            end_date,
+        )
+
         try:
             async with self._session.post(
                 USAGE_URL, headers=headers, json=payload
@@ -312,9 +325,25 @@ class APSUsageAPI:
                     async with self._session.post(
                         USAGE_URL, headers=headers, json=payload
                     ) as retry:
+                        retry_body = await retry.text()
+                        _LOGGER.debug(
+                            "APS: mobi retry HTTP %s: %s",
+                            retry.status,
+                            retry_body[:500],
+                        )
                         retry.raise_for_status()
                         return await retry.json(content_type=None)
-                response.raise_for_status()
+                # Log non-2xx responses before raising
+                if response.status >= 400:
+                    err_body = await response.text()
+                    _LOGGER.error(
+                        "APS: mobi HTTP %s body: %s | account_id=%s | token_prefix=%s",
+                        response.status,
+                        err_body[:500],
+                        account_id,
+                        (self._b2c_access_token or "")[:30] + "...",
+                    )
+                    response.raise_for_status()
                 return await response.json(content_type=None)
         except aiohttp.ClientError as err:
             raise Exception(f"Error fetching usage data: {err}") from err
