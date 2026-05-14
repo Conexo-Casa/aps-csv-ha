@@ -208,20 +208,10 @@ class APSUsageAPI:
         details = full.get("Details", {})
         profile = details.get("profileData", {})
 
-        # Log key values at ERROR so they appear in system_log for debugging
-        acct_list = (
-            details.get("UserDetails", {})
-            .get("getUserDetailResponse", {})
-            .get("AccountsList", [])
-        )
-        _LOGGER.error(
-            "APS: GetAllUserDetails — DefaultPremiseId=%s | SAStatusFlag=%s | "
-            "AccountID=%s | AccountsList[0]=%s | AccountsList[1]=%s",
+        _LOGGER.debug(
+            "APS: GetAllUserDetails — DefaultPremiseId=%s AccountID=%s",
             profile.get("DefaultPremiseId"),
-            profile.get("SAStatusFlag"),
             profile.get("AccountID"),
-            str(acct_list[0])[:400] if acct_list else "EMPTY",
-            str(acct_list[1])[:400] if len(acct_list) > 1 else "N/A",
         )
 
         if not profile:
@@ -262,127 +252,46 @@ class APSUsageAPI:
         # Extract deviceId and sASPList from AccountDetails
         acct_details = details.get("AccountDetails", {})
 
-        # Log full AccountDetails at ERROR level so it's visible in system_log
-        _LOGGER.error(
-            "APS: AccountDetails full=%s",
-            str(acct_details)[:1500],
+        # Extract deviceId and sASPList from getSASPListByAccountID in AccountDetails
+        # Structure: AccountDetails.getAccountDetailsResponse.getAccountDetailsRes
+        #              .getSASPListByAccountID.premiseDetailsList[N]
+        #                .premiseID  -> deviceId (DefaultPremiseId)
+        #                .sASPDetails[N].sPID -> each entry in sASPList
+        sasp_data = (
+            acct_details.get("getAccountDetailsResponse", {})
+            .get("getAccountDetailsRes", {})
+            .get("getSASPListByAccountID", {})
+        )
+        premise_list = sasp_data.get("premiseDetailsList", [])
+
+        _LOGGER.debug(
+            "APS: getSASPListByAccountID premise_list=%s", str(premise_list)[:400]
         )
 
         if not self._device_id:
-            # DefaultPremiseId is the service location / meter premise identifier
-            device_id = (
-                profile.get("DefaultPremiseId")
-                or acct_details.get("deviceId")
-                or acct_details.get("DeviceId")
-            )
+            # Use DefaultPremiseId from profile, confirmed by premiseID in SASP data
+            device_id = profile.get("DefaultPremiseId")
+            if not device_id and premise_list:
+                device_id = premise_list[0].get("premiseID")
             self._device_id = str(device_id) if device_id else None
-            _LOGGER.error("APS: device_id (DefaultPremiseId)=%s", self._device_id)
+            _LOGGER.debug("APS: device_id=%s", self._device_id)
 
         if not self._sasp_list:
-            # Build sASPList from AccountsList — each account is a Service Agreement
-            acct_list_raw = (
-                details.get("UserDetails", {})
-                .get("getUserDetailResponse", {})
-                .get("AccountsList", [])
-            )
-            # Try to extract SA identifiers; fall back to accountId itself
-            sasp = [
-                a.get("AccountID") for a in acct_list_raw if a.get("AccountID")
-            ] or ([self._account_id] if self._account_id else [])
-            self._sasp_list = sasp
-            _LOGGER.error("APS: sasp_list (from AccountsList)=%s", self._sasp_list)
+            # Extract sPID (Service Point ID) from all premises matching our deviceId
+            sp_ids: list[str] = []
+            for premise in premise_list:
+                if (
+                    str(premise.get("premiseID", "")) == self._device_id
+                    or not self._device_id
+                ):
+                    for sasp in premise.get("sASPDetails", []):
+                        sp_id = sasp.get("sPID")
+                        if sp_id:
+                            sp_ids.append(str(sp_id))
+            self._sasp_list = sp_ids or []
+            _LOGGER.debug("APS: sasp_list (sPIDs)=%s", self._sasp_list)
 
         _LOGGER.debug("APS: B2C_AccessToken obtained successfully.")
-
-        # Try to fetch real deviceId/sASPList from mobi account details endpoint
-        await self._fetch_mobi_account_details()
-
-    async def _fetch_mobi_account_details(self) -> None:
-        """Call mobi.aps.com getaccountdetails to get the real deviceId and sASPList.
-
-        This endpoint returns the Service Agreement / Service Point data that
-        getsimpleusagedata requires. We log the full response at ERROR level
-        so the correct field names are visible in system_log.
-        """
-        if not self._b2c_access_token or not self._account_id:
-            return
-
-        headers = {
-            "Host": "mobi.aps.com",
-            "User-Agent": _USER_AGENT,
-            "Accept": "application/json, text/plain, */*",
-            "Content-Type": "application/json;charset=utf-8",
-            "Ocp-Apim-Subscription-Key": OCP_APIM_KEY,
-            "Authorization": f"Bearer {self._b2c_access_token}",
-            "Origin": "https://www.aps.com",
-            "Referer": "https://www.aps.com/",
-        }
-
-        # Try multiple endpoint variants that might return device/SASP data
-        endpoints = [
-            (
-                "https://mobi.aps.com/customeraccountservices/v1/getaccountdetails",
-                {
-                    "getAccountDetailsRequest": {
-                        "accountId": self._account_id,
-                        "cssUser": "APSCOM",
-                    }
-                },
-            ),
-            (
-                "https://mobi.aps.com/customeraccountservices/v1/getdevicedetails",
-                {
-                    "getDeviceDetailsRequest": {
-                        "accountId": self._account_id,
-                        "cssUser": "APSCOM",
-                    }
-                },
-            ),
-            (
-                "https://mobi.aps.com/customeraccountservices/v1/getpremisedetails",
-                {
-                    "getPremiseDetailsRequest": {
-                        "accountId": self._account_id,
-                        "premiseId": self._device_id,
-                        "cssUser": "APSCOM",
-                    }
-                },
-            ),
-        ]
-
-        for url, payload in endpoints:
-            try:
-                async with self._session.post(
-                    url, headers=headers, json=payload
-                ) as resp:
-                    body = await resp.text()
-                    _LOGGER.error(
-                        "APS: mobi %s → HTTP %s: %s",
-                        url.split("/")[-1],
-                        resp.status,
-                        body[:600],
-                    )
-                    if resp.status == 200 and body.strip():
-                        import json as _json
-
-                        try:
-                            data = _json.loads(body)
-                            # Try to extract deviceId and sASPList from whatever comes back
-                            flat = str(data)
-                            if (
-                                "deviceId" in flat
-                                or "sASPList" in flat
-                                or "sasp" in flat.lower()
-                            ):
-                                _LOGGER.error(
-                                    "APS: Found device/sasp data in %s: %s",
-                                    url.split("/")[-1],
-                                    flat[:800],
-                                )
-                        except Exception:
-                            pass
-            except Exception as err:
-                _LOGGER.debug("APS: mobi %s failed: %s", url.split("/")[-1], err)
 
     async def _ensure_authenticated(self) -> None:
         """Ensure we have a valid, unexpired token."""
@@ -441,11 +350,13 @@ class APSUsageAPI:
         if self._sasp_list:
             req["sASPList"] = self._sasp_list
 
-        _LOGGER.error(
-            "APS: mobi payload req=%s device_id=%s sasp_list=%s",
-            req,
+        _LOGGER.debug(
+            "APS: mobi payload — account_id=%s device_id=%s sasp_list=%s dates=%s→%s",
+            account_id,
             self._device_id,
             self._sasp_list,
+            start_date,
+            end_date,
         )
 
         payload = {
