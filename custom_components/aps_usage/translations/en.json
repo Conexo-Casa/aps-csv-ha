@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "APS Usage",
+        "description": "Enter your APS account credentials to enable energy usage tracking.",
+        "data": {
+          "username": "APS account username (email)",
+          "password": "APS account password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid username or password.",
+      "cannot_connect": "Unable to connect to APS. Check your internet connection.",
+      "unknown": "An unexpected error occurred \u2014 check the Home Assistant logs."
+    },
+    "abort": {
+      "already_configured": "This APS account is already configured."
+    }
+  }
+}
