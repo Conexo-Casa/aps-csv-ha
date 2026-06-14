@@ -5,10 +5,11 @@
     "@Conexo-Casa"
   ],
   "config_flow": true,
-  "documentation": "https://github.com/Conexo-Casa/aps-usage-ha",
+  "dependencies": [],
+  "documentation": "https://github.com/Conexo-Casa/aps-csv-ha",
   "integration_type": "service",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/Conexo-Casa/aps-usage-ha/issues",
+  "issue_tracker": "https://github.com/Conexo-Casa/aps-csv-ha/issues",
   "requirements": [
     "cryptography>=41.0.0"
   ],
