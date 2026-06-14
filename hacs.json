@@ -1,6 +1,5 @@
 {
   "name": "APS Usage",
   "content_in_root": false,
-  "homeassistant": "2023.1.0",
-  "iot_class": "cloud_polling"
+  "homeassistant": "2023.1.0"
 }
