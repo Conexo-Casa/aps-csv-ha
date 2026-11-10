@@ -1,7 +1,7 @@
 # APS Usage — Home Assistant Integration
 
-[![GitHub Release](https://img.shields.io/github/release/conexocasa/aps-csv-ha.svg)](https://github.com/conexocasa/aps-csv-ha/releases)
-[![HACS Custom](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
+[![GitHub Release](https://img.shields.io/github/release/conexocasa/aps-csv-ha.svg)](https://github.com/Conexo-Casa/aps-csv-ha/releases)
+[![Home Assistant Marketplace](https://img.shields.io/badge/HA%20Marketplace-custom%20repository-41BDF5.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Conexo-Casa&repository=aps-csv-ha&category=integration)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 A custom Home Assistant integration for **Arizona Public Service (APS)** customers that provides real-time energy usage and billing sensors — no APS mobile app or CSV download required.
@@ -35,22 +35,34 @@ All sensors update **every hour**. Energy sensors (kWh) are compatible with the 
 
 ## Installation
 
-### Option A — HACS (Recommended)
+### Marketplace (Home Assistant 2026.11 and newer)
 
-1. Open HACS in Home Assistant.
-2. Go to **Integrations** → click the **⋮ menu** (top right) → **Custom repositories**.
-3. Enter the repository URL:
-   ```
-   https://github.com/conexocasa/aps-csv-ha
-   ```
-   Select **Integration** as the category and click **Add**.
-4. Search for **APS Usage** in the HACS integrations list and click **Download**.
-5. **Restart Home Assistant.**
-6. Follow [Configuration](#configuration) below.
+[![Open your Home Assistant instance and show this repository in the Marketplace.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=Conexo-Casa&repository=aps-csv-ha&category=integration)
 
-### Option B — Manual Installation
+Or by hand:
 
-1. Download the latest release from the [Releases page](https://github.com/conexocasa/aps-csv-ha/releases) or clone this repository.
+1. Go to **Settings → Marketplace**.
+2. Select **Add from link** (top right) and enter `Conexo-Casa/aps-csv-ha`.
+   The first time, Home Assistant asks you to connect GitHub. That is a one-time,
+   read-only sign-in on github.com.
+3. Open **APS Usage** and select **Install**. The setup screen opens right away; a first
+   install doesn't need a restart.
+
+Updates show up under **Settings → Updates**. After an update, Home Assistant shows a
+repair that offers to restart.
+
+### HACS (Home Assistant 2026.10 and older)
+
+1. HACS → **Integrations** → **⋮** → **Custom repositories**.
+2. Add `https://github.com/Conexo-Casa/aps-csv-ha`, category **Integration**.
+3. Download **APS Usage**, then restart Home Assistant.
+
+An existing HACS install moves to the Marketplace by itself when you upgrade to 2026.11.
+
+
+### Manual installation
+
+1. Download the latest release from the [Releases page](https://github.com/Conexo-Casa/aps-csv-ha/releases) or clone this repository.
 2. Copy the `custom_components/aps_usage/` folder into your Home Assistant config directory:
    ```
    config/
@@ -70,7 +82,7 @@ All sensors update **every hour**. Energy sensors (kWh) are compatible with the 
 > ```bash
 > mkdir -p /config/custom_components/aps_usage
 > for f in __init__.py api.py config_flow.py const.py manifest.json sensor.py; do
->   curl -sL "https://raw.githubusercontent.com/conexocasa/aps-csv-ha/main/custom_components/aps_usage/$f" \
+>   curl -sL "https://raw.githubusercontent.com/Conexo-Casa/aps-csv-ha/main/custom_components/aps_usage/$f" \
 >     -o "/config/custom_components/aps_usage/$f"
 > done
 > ```
