@@ -233,7 +233,7 @@ class APSDueDateSensor(_APSBase):
             return None
         for fmt in ("%m-%d-%Y", "%Y-%m-%d", "%m/%d/%Y", "%m-%d-%y"):
             try:
-                return datetime.strptime(val, fmt).date()  # noqa: DTZ007
+                return datetime.strptime(val, fmt).date()
             except ValueError:
                 continue
         return None

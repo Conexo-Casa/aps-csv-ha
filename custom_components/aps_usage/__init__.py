@@ -65,5 +65,5 @@ class APSDataCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(f"APS authentication error: {err}") from err
         except aiohttp.ClientError as err:
             raise UpdateFailed(f"APS connection error: {err}") from err
-        except Exception as err:  # noqa: BLE001
+        except Exception as err:
             raise UpdateFailed(f"APS unexpected error: {err}") from err
