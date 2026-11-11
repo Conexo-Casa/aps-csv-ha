@@ -29,7 +29,7 @@ All sensors update **every hour**. Energy sensors (kWh) are compatible with the 
 
 - Home Assistant **2023.1** or newer
 - An active **APS.com account** (aps.com login credentials)
-- The `cryptography` Python package (automatically installed by HA)
+- Nothing extra to install: the `cryptography` package it uses ships with Home Assistant
 
 ---
 
@@ -246,7 +246,7 @@ This integration was reverse-engineered from the APS website (`aps.com`) and the
 - Credentials are stored in **Home Assistant's encrypted config entry storage**. They are never logged or transmitted to any third party.
 - All network requests go directly to `www.aps.com` and `mobi.aps.com`.
 - The integration is **read-only** — it makes no changes to your APS account.
-- The integration requires `cryptography>=41.0.0` (a standard Python security library) for RSA password encryption.
+- The integration uses `cryptography` (included with Home Assistant) for RSA password encryption.
 
 ---
 
