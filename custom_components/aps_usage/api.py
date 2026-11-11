@@ -60,6 +60,10 @@ class APSAuthError(Exception):
     """Raised when APS authentication fails."""
 
 
+class APSApiError(Exception):
+    """Raised when the APS usage API fails or cannot be reached."""
+
+
 class APSUsageData:
     """Container for parsed daily usage data."""
 
@@ -444,13 +448,13 @@ class APSUsageAPI:
                         data = await retry.json(content_type=None)
                 elif resp.status != 200:
                     body = await resp.text()
-                    raise Exception(
+                    raise APSApiError(
                         f"Usage API returned HTTP {resp.status}: {body[:200]}"
                     )
                 else:
                     data = await resp.json(content_type=None)
         except aiohttp.ClientError as err:
-            raise Exception(f"Connection error fetching usage: {err}") from err
+            raise APSApiError(f"Connection error fetching usage: {err}") from err
 
         return APSUsageData(
             series=data.get("series", []),

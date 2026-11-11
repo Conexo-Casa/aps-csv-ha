@@ -50,8 +50,8 @@ class APSUsageConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             except aiohttp.ClientError as err:
                 _LOGGER.error("APS connection error: %s", err)
                 errors["base"] = "cannot_connect"
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.exception("Unexpected APS error: %s", err)
+            except Exception:
+                _LOGGER.exception("Unexpected APS error")
                 errors["base"] = "unknown"
             else:
                 return self.async_create_entry(
